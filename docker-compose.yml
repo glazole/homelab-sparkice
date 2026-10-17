@@ -1,0 +1,129 @@
+name: homelab-sparkice
+
+x-aws: &aws-env
+  AWS_REGION: ${AWS_REGION:-us-east-1}
+  AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+  AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY_ID:?Set RUSTFS_ACCESS_KEY_ID in .env}
+  AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_ACCESS_KEY:?Set RUSTFS_SECRET_ACCESS_KEY in .env}
+  AWS_EC2_METADATA_DISABLED: 'true'
+
+services:
+  spark-master:
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+      target: spark-base
+    image: handyman-spark:3.5.5-ice161
+    container_name: sparkice-master
+    hostname: spark-master
+    entrypoint: ['/opt/spark/bin/spark-class']
+    command: ['org.apache.spark.deploy.master.Master', '--host', 'spark-master', '--port', '7077', '--webui-port', '8080']
+    environment:
+      <<: *aws-env
+      SPARK_NO_DAEMONIZE: 'true'
+      SPARK_LOCAL_DIRS: /tmp/spark-local
+    networks: [outline]
+    volumes:
+      - ./conf/spark:/opt/spark/conf:ro
+      - spark-master-tmp:/tmp/spark-local
+    restart: unless-stopped
+    # Spark RPC and Web UI remain private on the Docker network.
+
+  spark-worker:
+    # Same Python environment as user drivers; Spark Python tasks remain compatible.
+    image: handyman-jupyter-spark:3.5.5-ice161
+    container_name: sparkice-worker
+    hostname: spark-worker
+    entrypoint: ['/opt/spark/bin/spark-class']
+    command: ['org.apache.spark.deploy.worker.Worker', '--cores', '3', '--memory', '4g', '--webui-port', '8082', 'spark://spark-master:7077']
+    environment:
+      <<: *aws-env
+      SPARK_NO_DAEMONIZE: 'true'
+      SPARK_LOCAL_DIRS: /tmp/spark-local
+      SPARK_WORKER_OPTS: '-Dspark.worker.cleanup.enabled=true -Dspark.worker.cleanup.interval=1800 -Dspark.worker.cleanup.appDataTtl=86400'
+      PYSPARK_PYTHON: /opt/jupyter-venv/bin/python
+    networks: [outline]
+    volumes:
+      - ./conf/spark:/opt/spark/conf:ro
+      - spark-worker-tmp:/tmp/spark-local
+    depends_on: [spark-master]
+    restart: unless-stopped
+    mem_limit: 5g
+
+  iceberg-rest:
+    image: tabulario/iceberg-rest:1.6.0
+    container_name: sparkice-iceberg-rest
+    hostname: iceberg-rest
+    environment:
+      <<: *aws-env
+      CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
+      CATALOG_URI: jdbc:postgresql://pg2:5432/iceberg_catalog
+      CATALOG_JDBC_DRIVER: org.postgresql.Driver
+      CATALOG_JDBC_USER: iceberg_app
+      CATALOG_JDBC_PASSWORD: ${ICEBERG_DB_PASSWORD:?Run ./prepare.sh}
+      CATALOG_WAREHOUSE: s3://${ICEBERG_BUCKET:-home-iceberg}/warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://rustfs:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: 'true'
+      CATALOG_S3_REGION: ${AWS_REGION:-us-east-1}
+    networks: [outline, db]
+    restart: unless-stopped
+    # Port 8181 is intentionally NOT published on the host.
+
+  jupyterhub:
+    build:
+      context: .
+      dockerfile: docker/jupyterhub/Dockerfile
+    image: handyman-jupyterhub:5.3.0-keycloak
+    container_name: sparkice-jupyterhub
+    hostname: jupyterhub
+    environment:
+      <<: *aws-env
+      RUSTFS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY_ID:?Set RUSTFS_ACCESS_KEY_ID}
+      RUSTFS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_ACCESS_KEY:?Set RUSTFS_SECRET_ACCESS_KEY}
+      KEYCLOAK_ISSUER: ${KEYCLOAK_ISSUER:?Set KEYCLOAK_ISSUER in .env}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-jupyterhub}
+      KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:?Set Keycloak client secret in .env}
+      JUPYTERHUB_PUBLIC_URL: ${JUPYTERHUB_PUBLIC_URL:-https://jupyter.handyman.moscow}
+      JUPYTERHUB_ALLOWED_USERS: ${JUPYTERHUB_ALLOWED_USERS:?Set the actual Keycloak preferred_username in .env}
+      JUPYTERHUB_ADMIN_USERS: ${JUPYTERHUB_ADMIN_USERS:-}
+      JUPYTER_SINGLEUSER_IMAGE: handyman-jupyter-spark:3.5.5-ice161
+      JUPYTER_DOCKER_NETWORK: outline-network
+      REQUESTS_CA_BUNDLE: /certs/ca-bundle.pem
+      SSL_CERT_FILE: /certs/ca-bundle.pem
+    networks: [outline]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./jupyterhub/jupyterhub_config.py:/srv/jupyterhub/jupyterhub_config.py:ro
+      - ./certs/ca-bundle.pem:/certs/ca-bundle.pem:ro
+      - jupyterhub-data:/data
+    command: ['jupyterhub', '-f', '/srv/jupyterhub/jupyterhub_config.py']
+    depends_on: [spark-master]
+    restart: unless-stopped
+    # Docker socket effectively grants host-level privileges to the Hub.
+
+  # Only built, never started during a normal `docker compose up`.
+  jupyter-image:
+    profiles: ['images']
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+      target: notebook
+    image: handyman-jupyter-spark:3.5.5-ice161
+    environment:
+      <<: *aws-env
+    networks: [outline]
+    command: ['true']
+
+volumes:
+  spark-master-tmp:
+  spark-worker-tmp:
+  jupyterhub-data:
+
+networks:
+  outline:
+    external: true
+    name: outline-network
+  db:
+    external: true
+    name: homelab-db

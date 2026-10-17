@@ -1,0 +1,42 @@
+.env
+.env.*
+!.env.example
+certs/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+logs/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+.vscode/
+.idea/
+*.log
+
+# Runtime
+/certs/
+/logs/
+/work/
+/data/
+/local/
+/secrets/
+
+# Private configuration
+.env
+.env.*
+!.env.example
+
+# Additional credentials
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Python / Jupyter
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
